@@ -1,6 +1,7 @@
 package com.example.myfirstapplication
 
 import android.Manifest
+import android.content.ContentValues
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -8,14 +9,16 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.result.contract.ActivityResultContracts.RequestPermission
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
@@ -26,6 +29,7 @@ import androidx.core.content.FileProvider
 import com.example.myfirstapplication.ui.theme.MyFirstApplicationTheme
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -34,31 +38,36 @@ class MainActivity : ComponentActivity() {
     private lateinit var photoFile: File
     private lateinit var currentPhotoPath: String
 
-    // Register the launcher at the top level of your activity
     private val requestPermissionLauncher = registerForActivityResult(
-        RequestPermission()
+        ActivityResultContracts.RequestPermission()
     ) { isGranted: Boolean ->
         if (isGranted) {
             dispatchTakePictureIntent()
         } else {
-            // Handle permission denial
+            Toast.makeText(this, "Camera permission denied", Toast.LENGTH_SHORT).show()
         }
     }
 
-    // Register the launcher at the top level of your activity
     private val takePictureLauncher = registerForActivityResult(
         ActivityResultContracts.TakePicture()
     ) { success: Boolean ->
         if (success) {
             val bitmap = BitmapFactory.decodeFile(currentPhotoPath)
-            // Process the bitmap with the TensorFlow Lite model
             val resultText = evaluateImage(bitmap)
-            setContent {
-                MyFirstApplicationTheme {
-                    Surface(modifier = Modifier.fillMaxSize()) {
-                        Content(bitmap = bitmap, resultText = resultText)
-                    }
-                }
+            showClassificationResult(bitmap, resultText)
+            saveImageToMediaStore(bitmap)
+        }
+    }
+
+    private val galleryLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK) {
+            val imageUri: Uri? = result.data?.data
+            if (imageUri != null) {
+                val bitmap = loadImageFromUri(imageUri)
+                val resultText = evaluateImage(bitmap)
+                showClassificationResult(bitmap, resultText)
             }
         }
     }
@@ -66,28 +75,29 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Initialize the TFLite model
         try {
             tfliteModel = TFLiteModel(assets, "mobilenetv3small_persea_mite_detector.tflite")
         } catch (e: IOException) {
             e.printStackTrace()
         }
 
+        showMainView()
+    }
+
+    private fun showMainView() {
         setContent {
             MyFirstApplicationTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
-                    var imageUri by remember { mutableStateOf<Uri?>(null) }
-                    var resultText by remember { mutableStateOf("No result") }
-
-                    val context = LocalContext.current
-
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(16.dp)
-                    ) {
-                        Button(onClick = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.SpaceBetween,
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    MainViewButtons(
+                        onTakePictureClick = {
                             if (ContextCompat.checkSelfPermission(
-                                    context,
+                                    this@MainActivity,
                                     Manifest.permission.CAMERA
                                 ) != android.content.pm.PackageManager.PERMISSION_GRANTED
                             ) {
@@ -95,16 +105,21 @@ class MainActivity : ComponentActivity() {
                             } else {
                                 dispatchTakePictureIntent()
                             }
-                        }) {
-                            Text(text = "Take Picture")
-                        }
+                        },
+                        onLaunchGalleryClick = { launchGallery() }
+                    )
+                }
+            }
+        }
+    }
 
-                        imageUri?.let {
-                            val bitmap = BitmapFactory.decodeFile(currentPhotoPath)
-                            Image(bitmap = bitmap.asImageBitmap(), contentDescription = null)
-                            Text(text = resultText)
-                        }
-                    }
+    private fun showClassificationResult(bitmap: Bitmap, resultText: String) {
+        setContent {
+            MyFirstApplicationTheme {
+                Surface(modifier = Modifier.fillMaxSize()) {
+                    Content(bitmap = bitmap, resultText = resultText, onReturnClick = {
+                        showMainView()
+                    })
                 }
             }
         }
@@ -116,7 +131,7 @@ class MainActivity : ComponentActivity() {
             try {
                 photoFile = createImageFile()
             } catch (ex: IOException) {
-                // Handle error
+                Toast.makeText(this, "Error creating file", Toast.LENGTH_SHORT).show()
             }
             if (::photoFile.isInitialized) {
                 val photoURI: Uri = FileProvider.getUriForFile(
@@ -142,6 +157,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun saveImageToMediaStore(bitmap: Bitmap) {
+        val resolver = contentResolver
+        val contentValues = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "IMG_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES)
+        }
+
+        val uri: Uri? = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+        uri?.let {
+            resolver.openOutputStream(uri)?.use { outputStream ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 100, outputStream)
+            }
+        }
+    }
+
     private fun evaluateImage(bitmap: Bitmap): String {
         val result = tfliteModel.predict(bitmap)
         var maxIndex = -1
@@ -154,16 +185,108 @@ class MainActivity : ComponentActivity() {
         }
         return if (maxIndex == 0) "Healthy" else "Plague"
     }
+
+    private fun loadImageFromUri(imageUri: Uri): Bitmap {
+        val inputStream: InputStream? = contentResolver.openInputStream(imageUri)
+        return BitmapFactory.decodeStream(inputStream)
+    }
+
+    private fun launchGallery() {
+        val intent = Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
+        galleryLauncher.launch(intent)
+    }
 }
 
 @Composable
-fun Content(bitmap: Bitmap, resultText: String) {
+fun Content(bitmap: Bitmap?, resultText: String, onReturnClick: () -> Unit) {
     Column(
-        modifier = Modifier.padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+        modifier = Modifier
+            .padding(16.dp)
+            .fillMaxSize(),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Image(bitmap = bitmap.asImageBitmap(), contentDescription = null)
-        Text(text = resultText)
+        if (bitmap != null) {
+            Image(bitmap = bitmap.asImageBitmap(), contentDescription = null)
+        } else {
+            Box(
+                modifier = Modifier
+                    .size(200.dp)
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("No Image", color = MaterialTheme.colorScheme.primary)
+            }
+        }
+        Text(text = "Classified as: $resultText")
+
+        // Styled button to return to the main view
+        Button(
+            onClick = onReturnClick,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary
+            ),
+            shape = MaterialTheme.shapes.medium,
+            modifier = Modifier
+                .padding(top = 16.dp)
+                .height(50.dp)
+                .fillMaxWidth(0.8f) // Adjust button width
+        ) {
+            Text("Return to Main View", style = MaterialTheme.typography.bodyLarge)
+        }
+    }
+}
+
+@Composable
+fun MainViewButtons(
+    onTakePictureClick: () -> Unit,
+    onLaunchGalleryClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.SpaceBetween, // Distributes space between elements
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Spacer(modifier = Modifier.weight(1f)) // Takes up available space and pushes buttons to the bottom
+
+        Column(
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            // Styled "Take Picture" button
+            Button(
+                onClick = onTakePictureClick,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.secondary,
+                    contentColor = MaterialTheme.colorScheme.onSecondary
+                ),
+                shape = MaterialTheme.shapes.medium,
+                modifier = Modifier
+                    .height(50.dp)
+                    .fillMaxWidth(0.8f) // Adjust button width
+            ) {
+                Text("Take Picture", style = MaterialTheme.typography.bodyLarge)
+            }
+
+            // Styled "Launch Gallery" button
+            Button(
+                onClick = onLaunchGalleryClick,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.tertiary,
+                    contentColor = MaterialTheme.colorScheme.onTertiary
+                ),
+                shape = MaterialTheme.shapes.medium,
+                modifier = Modifier
+                    .height(50.dp)
+                    .fillMaxWidth(0.8f) // Adjust button width
+            ) {
+                Text("Launch Gallery", style = MaterialTheme.typography.bodyLarge)
+            }
+        }
     }
 }
 
@@ -173,7 +296,8 @@ fun DefaultPreview() {
     MyFirstApplicationTheme {
         Content(
             bitmap = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888),
-            resultText = "Healthy"
+            resultText = "Healthy",
+            onReturnClick = {}
         )
     }
 }
